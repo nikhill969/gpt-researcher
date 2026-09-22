@@ -28,6 +28,12 @@ from server.server_utils import (
     execute_multi_agents, handle_websocket_communication
 )
 from server.agent_discovery import build_agent_discovery_document
+from server.llm_settings import (
+    SettingsValidationError,
+    apply_persisted_settings,
+    get_llm_settings as read_llm_settings,
+    save_llm_settings as persist_llm_settings,
+)
 
 from server.websocket_manager import run_agent
 from utils import write_md_to_word, write_md_to_pdf
@@ -68,12 +74,27 @@ class ChatRequest(BaseModel):
     messages: List[Dict[str, Any]]
 
 
+class LlmSettingsRequest(BaseModel):
+    """Payload for updating the LLM connection settings from the web UI.
+
+    ``api_key`` is optional: leaving it blank keeps the already-stored key.
+    """
+
+    api_key: str | None = None
+    base_url: str | None = None
+    model_id: str | None = None
+    clear_api_key: bool = False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     os.makedirs("outputs", exist_ok=True)
     app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
-    
+
+    # Pick up LLM connection settings saved from the web UI before serving.
+    apply_persisted_settings()
+
     # Mount frontend static files
     frontend_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend")
     if os.path.exists(frontend_path):
@@ -170,6 +191,37 @@ async def agent_discovery(request: Request):
     response = JSONResponse(content=document)
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
+
+@app.get("/api/settings/llm")
+async def get_llm_settings():
+    """Return the LLM connection settings with the API key masked.
+
+    The raw API key is never included in the response and the result is marked
+    `no-store` so a masked preview is not cached by intermediaries.
+    """
+    settings = read_llm_settings()
+    return JSONResponse(content=settings, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/settings/llm")
+async def update_llm_settings(payload: LlmSettingsRequest):
+    """Validate, persist and immediately apply LLM connection settings.
+
+    Blank `api_key` values keep the stored key; set `clear_api_key` to remove
+    it. The response echoes the settings back with the key masked.
+    """
+    try:
+        settings = persist_llm_settings(
+            api_key=payload.api_key,
+            base_url=payload.base_url,
+            model_id=payload.model_id,
+            clear_api_key=payload.clear_api_key,
+        )
+    except SettingsValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return JSONResponse(content=settings, headers={"Cache-Control": "no-store"})
+
 
 @app.get("/report/{research_id}")
 async def read_report(request: Request, research_id: str):

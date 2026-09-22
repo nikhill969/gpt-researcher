@@ -63,6 +63,9 @@ const GPTResearcher = (() => {
     // Initialize MCP functionality
     initMCPSection();
 
+    // Initialize LLM settings panel
+    initSettingsPanel();
+
     // The download bar is now fixed in place with CSS
     // No need to set display property here
 
@@ -2465,6 +2468,214 @@ const GPTResearcher = (() => {
     }
   };
 
+  // == LLM Settings ==========================================================
+  // The Settings panel talks to /api/settings/llm, which persists values to the
+  // server's .env file and applies them to the running process. The API key is
+  // never sent back to the browser in full -- only a masked preview -- and it is
+  // only ever submitted in a POST body, never in a URL or query string.
+  const LLM_SETTINGS_ENDPOINT = '/api/settings/llm';
+  let llmSettingsState = { api_key_set: false };
+
+  const initSettingsPanel = () => {
+    const openBtn = document.getElementById('settingsOpenBtn');
+    if (!openBtn) return;
+
+    createSettingsModal();
+
+    openBtn.addEventListener('click', () => {
+      const modal = document.getElementById('settingsModal');
+      if (modal) modal.classList.add('visible');
+      loadLlmSettings();
+    });
+
+    // Preload so the nav button can hint when no API key is configured yet.
+    loadLlmSettings();
+  };
+
+  const createSettingsModal = () => {
+    if (document.getElementById('settingsModal')) return;
+
+    const modal = document.createElement('div');
+    modal.id = 'settingsModal';
+    modal.className = 'settings-modal';
+    modal.innerHTML = `
+      <div class="settings-modal-content">
+        <button class="settings-modal-close" title="Close settings" aria-label="Close settings">
+          <i class="fas fa-times"></i>
+        </button>
+        <h3><i class="fas fa-sliders-h"></i> LLM Settings</h3>
+        <p class="settings-modal-intro">
+          Point GPT Researcher at an OpenAI-compatible endpoint. Settings are saved on the
+          server and applied to your next research run without a restart.
+        </p>
+
+        <form id="llmSettingsForm">
+          <div class="settings-field">
+            <label for="settingsApiKey">API Key</label>
+            <div class="settings-input-group">
+              <input type="password" id="settingsApiKey" class="form-control"
+                     autocomplete="new-password" spellcheck="false" placeholder="Not set">
+              <button type="button" class="settings-reveal-btn" id="settingsApiKeyToggle"
+                      title="Show or hide the value you are typing" aria-label="Show or hide API key">
+                <i class="fas fa-eye"></i>
+              </button>
+            </div>
+            <small class="settings-hint" id="settingsApiKeyHint">No API key stored.</small>
+          </div>
+
+          <div class="settings-field">
+            <label for="settingsBaseUrl">Base URL</label>
+            <input type="url" id="settingsBaseUrl" class="form-control"
+                   placeholder="https://api.openai.com/v1" spellcheck="false">
+            <small class="settings-hint">Leave blank to use the provider default. Any OpenAI-compatible endpoint works.</small>
+          </div>
+
+          <div class="settings-field">
+            <label for="settingsModelId">Model ID</label>
+            <input type="text" id="settingsModelId" class="form-control"
+                   placeholder="gpt-4o-mini" spellcheck="false">
+            <small class="settings-hint">Applied to the fast, smart and strategic models. Use <code>provider:model</code> for non-OpenAI providers, e.g. <code>ollama:llama3</code>.</small>
+          </div>
+
+          <div class="settings-actions">
+            <button type="button" class="settings-clear-btn" id="settingsClearApiKey">Remove stored key</button>
+            <button type="submit" class="settings-save-btn" id="settingsSaveBtn">Save</button>
+          </div>
+        </form>
+      </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    const close = () => modal.classList.remove('visible');
+
+    modal.querySelector('.settings-modal-close').addEventListener('click', close);
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) close();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && modal.classList.contains('visible')) close();
+    });
+
+    // Only the value the user is currently typing is revealed; the stored key
+    // is never rendered, so there is nothing else to un-mask.
+    const apiKeyInput = modal.querySelector('#settingsApiKey');
+    modal.querySelector('#settingsApiKeyToggle').addEventListener('click', () => {
+      apiKeyInput.type = apiKeyInput.type === 'password' ? 'text' : 'password';
+    });
+
+    modal.querySelector('#llmSettingsForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      submitLlmSettings();
+    });
+
+    modal.querySelector('#settingsClearApiKey').addEventListener('click', () => {
+      submitLlmSettings({ clearApiKey: true });
+    });
+  };
+
+  const setSettingsStatus = (message, isError = false) => {
+    const hint = document.getElementById('settingsApiKeyHint');
+    if (!hint) return;
+    hint.textContent = message;
+    hint.classList.toggle('settings-hint-error', isError);
+  };
+
+  const applyLlmSettingsToForm = (settings) => {
+    llmSettingsState = settings || {};
+
+    const apiKeyInput = document.getElementById('settingsApiKey');
+    const baseUrlInput = document.getElementById('settingsBaseUrl');
+    const modelInput = document.getElementById('settingsModelId');
+    const clearBtn = document.getElementById('settingsClearApiKey');
+
+    if (apiKeyInput) {
+      // Never write a stored key into the DOM; show only the masked preview as
+      // placeholder text so the user can tell a key is already configured.
+      apiKeyInput.value = '';
+      apiKeyInput.placeholder = settings.api_key_set
+        ? `Stored: ${settings.api_key_masked}`
+        : 'Not set';
+    }
+    if (baseUrlInput) baseUrlInput.value = settings.base_url || '';
+    if (modelInput) modelInput.value = settings.model_id || '';
+    if (clearBtn) clearBtn.disabled = !settings.api_key_set;
+
+    const openBtn = document.getElementById('settingsOpenBtn');
+    if (openBtn) {
+      openBtn.classList.toggle('settings-unconfigured', !settings.api_key_set);
+      openBtn.title = settings.api_key_set
+        ? 'LLM settings configured'
+        : 'LLM settings: no API key stored';
+    }
+
+    if (settings.api_key_set) {
+      setSettingsStatus(`Key stored on the server (${settings.api_key_masked}). Leave the field blank to keep it.`);
+    } else {
+      setSettingsStatus('No API key stored. Enter one to enable research.', true);
+    }
+  };
+
+  const loadLlmSettings = async () => {
+    try {
+      const response = await fetch(LLM_SETTINGS_ENDPOINT, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+        cache: 'no-store'
+      });
+      if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+      applyLlmSettingsToForm(await response.json());
+    } catch (error) {
+      console.error('Could not load LLM settings:', error);
+      setSettingsStatus('Could not load saved settings from the server.', true);
+    }
+  };
+
+  const submitLlmSettings = async ({ clearApiKey = false } = {}) => {
+    const apiKeyInput = document.getElementById('settingsApiKey');
+    const baseUrlInput = document.getElementById('settingsBaseUrl');
+    const modelInput = document.getElementById('settingsModelId');
+    const saveBtn = document.getElementById('settingsSaveBtn');
+
+    const payload = { clear_api_key: clearApiKey };
+    const typedKey = apiKeyInput ? apiKeyInput.value.trim() : '';
+    if (typedKey) payload.api_key = typedKey;
+    if (baseUrlInput) payload.base_url = baseUrlInput.value.trim();
+    if (modelInput) payload.model_id = modelInput.value.trim();
+
+    if (saveBtn) {
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving...';
+    }
+
+    try {
+      const response = await fetch(LLM_SETTINGS_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify(payload)  // key travels in the body only
+      });
+
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(body.detail || `Request failed with status ${response.status}`);
+      }
+
+      applyLlmSettingsToForm(body);
+      if (apiKeyInput) apiKeyInput.value = '';
+      showToast('LLM settings saved and applied');
+    } catch (error) {
+      console.error('Could not save LLM settings:', error);
+      setSettingsStatus(error.message || 'Could not save settings.', true);
+      showToast('Could not save LLM settings');
+    } finally {
+      if (saveBtn) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save';
+      }
+    }
+  };
+
   return {
     init,
     startResearch,
@@ -2477,7 +2688,10 @@ const GPTResearcher = (() => {
     importHistory: triggerImportHistory,  // Add import function to return object
     initChat,
     sendChatMessage,
-    addChatMessage
+    addChatMessage,
+    initSettingsPanel,
+    loadLlmSettings,
+    submitLlmSettings
   }
 })()
 
