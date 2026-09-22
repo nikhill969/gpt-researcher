@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import time
 import logging
 import sys
@@ -33,6 +33,7 @@ from server.llm_settings import (
     apply_persisted_settings,
     get_llm_settings as read_llm_settings,
     save_llm_settings as persist_llm_settings,
+    test_connection,
 )
 
 from server.websocket_manager import run_agent
@@ -221,6 +222,39 @@ async def update_llm_settings(payload: LlmSettingsRequest):
         raise HTTPException(status_code=400, detail=str(exc))
 
     return JSONResponse(content=settings, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/settings/llm/test")
+async def test_llm_connection():
+    """Attempt a lightweight call to the configured LLM endpoint.
+
+    Returns a dict with ``success`` (bool), ``message`` (str) and an optional
+    ``details`` field containing any error information. The raw API key is
+    never included in the response.
+    """
+    result = read_llm_settings()
+    if not result.get("api_key_set"):
+        return JSONResponse(
+            content={**result, "connection_test": {"success": False, "message": "No API key set", "details": ""}},
+            headers={"Cache-Control": "no-store"},
+        )
+    result["connection_test"] = test_result(test_connection())
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
+def test_result(conn: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize a ``test_connection`` result for the client."""
+    if not conn or not isinstance(conn, dict):
+        return {
+            "success": False,
+            "message": "Connection test failed",
+            "details": "No response from the backend.",
+        }
+    ok = conn.get("success")
+    msg = conn.get("message", "Unknown error")
+    details = conn.get("details", "")
+    label = f"{msg} – {details}" if details else msg
+    return {"success": ok, "message": label, "details": details}
 
 
 @app.get("/report/{research_id}")

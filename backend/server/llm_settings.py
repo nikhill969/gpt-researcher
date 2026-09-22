@@ -124,7 +124,14 @@ def _harden_env_file() -> None:
 
 
 def _write_env_value(key: str, value: Optional[str]) -> None:
-    """Set `key` to `value` in `.env`, or remove it when `value` is None."""
+    """Set ``key`` to ``value`` in .env using safe parsing, or remove it.
+
+    python-dotenv's ``set_key(..., quote_mode='always')`` writes literal quote
+    characters into the file.  On some versions those quotes are *not* stripped
+    by dotenv itself, causing downstream config parsers (e.g. Config.parse_llm)
+    to see e.g. ``'openai`` as a provider name.  We avoid this by removing
+    existing keys first and writing raw lines ourselves.
+    """
     if value is None:
         if not ENV_PATH.exists():
             return
@@ -133,7 +140,17 @@ def _write_env_value(key: str, value: Optional[str]) -> None:
 
     if not ENV_PATH.exists():
         ENV_PATH.touch()
-    set_key(str(ENV_PATH), key, value, quote_mode="always")
+
+    # Remove any prior definition of this key
+    _remove_env_key(key)
+
+    try:
+        lines = ENV_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        lines = []
+
+    new_lines = lines + [f"{key}={value}\n"]
+    ENV_PATH.write_text("".join(new_lines), encoding="utf-8")
     _harden_env_file()
 
 
@@ -251,3 +268,157 @@ def save_llm_settings(
     )
 
     return get_llm_settings()
+
+
+def test_connection() -> Dict[str, Any]:
+    """Attempt a lightweight call to the configured LLM endpoint.
+
+    Reads the current environment (already synced with .env via
+    ``_apply_to_environ``), builds an OpenAI-compatible ChatClient, and sends
+    a minimal prompt. Errors are caught and returned so the UI can show a clear
+    message without crashing.
+    """
+    try:
+        api_key = os.environ.get(API_KEY_VAR) or _read_env_file().get(API_KEY_VAR) or ""
+        if not api_key:
+            return {
+                "success": False,
+                "message": "No API key set",
+                "details": "Enter an API key in the Settings panel before testing.",
+            }
+
+        # Read the effective model from env (or .env as fallback)
+        raw_model = ""
+        for key in MODEL_VARS:
+            raw_model = os.environ.get(key) or _read_env_file().get(key) or ""
+            if raw_model:
+                break
+
+        if not raw_model:
+            return {
+                "success": False,
+                "message": "No LLM model configured",
+                "details": "Set SMART_LLM or FAST_LLM before testing.",
+            }
+
+        # Normalize: ensure provider:model format.
+        normalized_model = _normalize_model(raw_model)
+        provider_name, _, model_name = normalized_model.partition(":")
+
+        # Build kwargs based on provider type.
+        provider_kwargs: Dict[str, Any] = {"model": model_name}
+        base_url = os.environ.get(BASE_URL_VAR) or _read_env_file().get(BASE_URL_VAR)
+        if base_url:
+            provider_kwargs["openai_api_base"] = base_url
+
+        # Lazy-load the right client class.
+        global _OPENAI_CLIENT_CLS
+        if _OPENAI_CLIENT_CLS is None:
+            _load_openai_client()
+
+        if provider_name == "openai" or (_OPENAI_CLIENT_CLS and provider_name not in _PROVIDER_SPECIAL):
+            if _OPENAI_CLIENT_CLS:
+                provider_kwargs["api_key"] = api_key
+                client = _OPENAI_CLIENT_CLS(**provider_kwargs)
+                return _send_test_message(client)
+            else:
+                raise ImportError("langchain_openai.ChatOpenAI not available")
+
+        # For non-OpenAI providers, fall back to GenericLLMProvider.
+        from gpt_researcher.llm_provider.generic.base import GenericLLMProvider
+
+        llm_instance = GenericLLMProvider.from_provider(provider_name, **provider_kwargs)
+        return _send_test_message(llm_instance)
+
+    except Exception as exc:  # pragma: no cover - depends on installed packages
+        msg = str(exc).strip().encode("ascii", "replace").decode("ascii")
+        return {
+            "success": False,
+            "message": "Failed to reach the endpoint",
+            "details": f"{exc.__class__.__name__}: {msg[:150]}",
+        }
+
+
+# Providers whose models are passed through OpenAI-compatible ChatOpenAI
+# (i.e., they speak the OpenAI chat completions API).
+_PROVIDERS_THROUGH_OPENAI = frozenset({
+    "openai",
+    "vllm_openai",
+    "litellm",
+    "openrouter",
+    "together",
+    "mistralai",
+    "fireworks",
+    "groq",
+    "huggingface",
+    "cohere",
+})
+
+# Set once by _load_openai_client.
+_OPENAI_CLIENT_CLS: Any = None
+
+
+def _load_openai_client() -> None:
+    """Lazy-load langchain_openai.ChatOpenAI for connection testing."""
+    try:
+        from langchain_openai import ChatOpenAI as CoC
+    except ImportError:
+        CoC = None  # type: ignore
+    global _OPENAI_CLIENT_CLS
+    _OPENAI_CLIENT_CLS = CoC
+
+
+def _send_test_message(client: Any) -> Dict[str, Any]:
+    """Send a minimal prompt and return a result dict."""
+    try:
+        # Prefer the standard langchain invocation signature.
+        if hasattr(client, "invoke"):
+            from langchain_core.messages import HumanMessage
+
+            response = client.invoke([HumanMessage(content="Say 'ok'")])
+            content = getattr(response, "content", "") or ""
+        elif hasattr(client, "create_chat_completion"):
+            # Some internal wrappers use this signature.
+            resp = client.create_chat_completion(
+                messages=[{"role": "user", "content": "Say 'ok'"}],
+                config_dict=None,
+                stream=False,
+            )
+            content = (
+                getattr(resp, "choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+        else:
+            # Last resort: bare openai-python API via httpx.
+            import httpx
+
+            base_url = getattr(client, "base_url", None)
+            headers = {"Authorization": f"Bearer {getattr(client, 'api_key', '')}", "Content-Type": "application/json"}
+            payload = {
+                "model": getattr(client, "model", ""),
+                "messages": [{"role": "user", "content": "Say 'ok'"}],
+            }
+            url = f"{base_url}/chat/completions" if base_url else "https://api.openai.com/v1/chat/completions"
+            with httpx.Client() as http:
+                r = http.post(url.strip("/") + "/chat/completions", json=payload, headers=headers, timeout=30)
+                data = r.json()
+                content = data["choices"][0]["message"]["content"]
+        if content and len(str(content)) > 0:
+            return {
+                "success": True,
+                "message": "Connection successful",
+                "details": f"Model responded ({len(str(content))} chars)",
+            }
+        return {
+            "success": False,
+            "message": "Endpoint returned an empty response",
+            "details": "Check that the model accepts short prompts.",
+        }
+    except Exception as inner:
+        raise inner from None
+
+
+# Map of supported provider names to their actual classes so we don't always
+# use GenericLLMProvider (which defaults to openai internally).
+# Kept for future extension; currently test_connection uses ChatOpenAI directly.

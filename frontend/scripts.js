@@ -2538,9 +2538,11 @@ const GPTResearcher = (() => {
           </div>
 
           <div class="settings-actions">
+            <button type="button" class="settings-test-btn" id="settingsTestBtn">Test Connection</button>
             <button type="button" class="settings-clear-btn" id="settingsClearApiKey">Remove stored key</button>
             <button type="submit" class="settings-save-btn" id="settingsSaveBtn">Save</button>
           </div>
+          <div class="settings-result" id="settingsResult"></div>
         </form>
       </div>
     `;
@@ -2572,6 +2574,49 @@ const GPTResearcher = (() => {
     modal.querySelector('#settingsClearApiKey').addEventListener('click', () => {
       submitLlmSettings({ clearApiKey: true });
     });
+
+    // Test connection button
+    const testBtn = modal.querySelector('#settingsTestBtn');
+    if (testBtn) {
+      testBtn.addEventListener('click', async () => {
+        try {
+          testBtn.disabled = true;
+          testBtn.textContent = 'Testing...';
+          const resp = await fetch('/api/settings/llm/test', {
+            method: 'POST',
+            headers: { Accept: 'application/json' },
+            cache: 'no-store'
+          });
+          const body = await resp.json().catch(() => ({}));
+          showConnectionResult(body);
+        } catch (err) {
+          console.error('Test failed:', err);
+          showConnectionResult({ success: false, message: 'Request failed', details: String(err) });
+        } finally {
+          if (testBtn) {
+            testBtn.disabled = false;
+            testBtn.textContent = 'Test Connection';
+          }
+        }
+      });
+    }
+  };
+
+  const showConnectionResult = (result) => {
+    const box = document.getElementById('settingsResult');
+    if (!box) return;
+    const ct = result && result.connection_test ? result.connection_test : null;
+    const ok = ct && ct.success;
+    box.className = `settings-result ${ok ? 'settings-result-ok' : 'settings-result-error'}`;
+    let msg = ok
+      ? ct.message + (ct.details ? ' — ' + ct.details : '')
+      : (result.detail || 'Could not reach the endpoint.');
+    if (ct && !ok) {
+      // Show provider-specific guidance when available.
+      msg = ct.message;
+      if (ct.details) msg += ' – ' + ct.details;
+    }
+    box.textContent = msg;
   };
 
   const setSettingsStatus = (message, isError = false) => {
@@ -2598,7 +2643,16 @@ const GPTResearcher = (() => {
         : 'Not set';
     }
     if (baseUrlInput) baseUrlInput.value = settings.base_url || '';
-    if (modelInput) modelInput.value = settings.model_id || '';
+    if (modelInput) {
+      // Strip the default openai: prefix from the saved value so the UI
+      // shows only what the user entered, but keep provider:model intact
+      // for non-openai providers.
+      let raw = settings.model_id || '';
+      if (raw.startsWith('openai:')) {
+        raw = raw.slice(7);
+      }
+      modelInput.value = raw;
+    }
     if (clearBtn) clearBtn.disabled = !settings.api_key_set;
 
     const openBtn = document.getElementById('settingsOpenBtn');
